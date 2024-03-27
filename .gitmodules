@@ -1,0 +1,3 @@
+[submodule "extlib/kamping"]
+	path = extlib/kamping
+	url = git@github.com:kamping-site/kamping
