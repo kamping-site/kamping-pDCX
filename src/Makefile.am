@@ -1,6 +1,6 @@
 bin_PROGRAMS = pDCX
 
-pDCX_SOURCES = dc.cpp
+pDCX_SOURCES = mpi_dc.cpp
 
 #sa_check_SOURCES = sa_check.cpp tuple.cpp
 

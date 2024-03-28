@@ -28,11 +28,25 @@
 #include <limits>
 #include <sstream>
 #include <errno.h>
+#include <cstring>
 
 //#include <proc/readproc.h>
 
 #include "yuta-sais-lite.h"
 #include "sachecker.h"
+
+// KaMPIng includes
+#include <kamping/environment.hpp>
+#include <kamping/communicator.hpp>
+#include <kamping/collectives/allgather.hpp>
+#include <kamping/collectives/alltoall.hpp>
+#include <kamping/collectives/barrier.hpp>
+#include <kamping/collectives/bcast.hpp>
+#include <kamping/collectives/gather.hpp>
+#include <kamping/collectives/scan.hpp>
+#include <kamping/p2p/recv.hpp>
+#include <kamping/p2p/send.hpp>
+
 
 #define DBG_LIMIT	100
 
@@ -696,7 +710,7 @@ public:
 	    int 	blocklen[3] = { 1, 1, 1 };
 	    MPI_Aint	displace[3] = { DISP(p,name), DISP(p,index), DISP(p,unique) };
 
-	    MPI_Type_struct( 3, blocklen, displace, typelist, &MPI_PAIR );
+	    MPI_Type_create_struct( 3, blocklen, displace, typelist, &MPI_PAIR );
 	    MPI_Type_commit( &MPI_PAIR );
 	}
 
@@ -708,7 +722,7 @@ public:
 	    int 	blocklen[3] = { 1, 1, 1 };
 	    MPI_Aint	displace[3] = { DISP(t,rank1), DISP(t,rank2), DISP(t,char1) };
 
-	    MPI_Type_struct( 3, blocklen, displace, typelist, &MPI_TRIPLE );
+	    MPI_Type_create_struct( 3, blocklen, displace, typelist, &MPI_TRIPLE );
 	    MPI_Type_commit( &MPI_TRIPLE );
 	}
 
@@ -720,7 +734,7 @@ public:
 	    int 	blocklen[2] = { X, 1 };
 	    MPI_Aint	displace[2] = { DISP(t,chars), DISP(t,index) };
 
-	    MPI_Type_struct( 2, blocklen, displace, typelist, &MPI_TUPLE_SAMPLE );
+	    MPI_Type_create_struct( 2, blocklen, displace, typelist, &MPI_TUPLE_SAMPLE );
 	    MPI_Type_commit( &MPI_TUPLE_SAMPLE );
 	}
 
@@ -732,7 +746,7 @@ public:
 	    int 	blocklen[3] = { X-1, D, 1 };
 	    MPI_Aint	displace[3] = { DISP(t,chars), DISP(t,ranks), DISP(t,index) };
 
-	    MPI_Type_struct( 3, blocklen, displace, typelist, &MPI_TUPLE_NONSAMPLE );
+	    MPI_Type_create_struct( 3, blocklen, displace, typelist, &MPI_TUPLE_NONSAMPLE );
 	    MPI_Type_commit( &MPI_TUPLE_NONSAMPLE );
 	}
 
@@ -872,7 +886,7 @@ public:
 	return (i != nprocs-1) ? (X-1) : 0;
     }
 
-    bool dcx( std::vector<alphabet_type>& input, uint depth, uint K )
+  bool dcx( std::vector<alphabet_type>& input, uint depth, uint K, kamping::Communicator<>& comm)
     {
 	const unsigned int* DC = DCParam::DC;
 
@@ -883,29 +897,28 @@ public:
 
 	unsigned int localSize = input.size();
 
-	unsigned int localSizes[nprocs+1];
+  auto localSizes = comm.allgather(kamping::send_buf(localSize));
+  localSizes.resize(comm.size() + 1);
 
-	MPI_Allgather( &localSize, 1, MPI_UNSIGNED, localSizes, 1, MPI_UNSIGNED, MPI_COMM_WORLD );
+	exclusive_prefixsum(localSizes.data(), comm.size());
 
-	exclusive_prefixsum(localSizes, nprocs);
-
-	DBG_ARRAY2(debug_rebalance, "localSizes", localSizes, nprocs+1);
+	DBG_ARRAY2(debug_rebalance, "localSizes", localSizes.data(), comm.size() + 1);
 
 	// calculate localStride
 
-	const uint globalSize = localSizes[nprocs];			// global size of input
+	const uint globalSize = localSizes[comm.size()];			// global size of input
 
-	uint localStride = ( globalSize + nprocs - 1 ) / nprocs;	// divide by processors rounding up
+	uint localStride = ( globalSize + comm.size() - 1 ) / nprocs;	// divide by processors rounding up
 	localStride += X - localStride % X;				// round up to nearest multiple of X
 
-	const unsigned int localOffset = myproc * localStride;
-	localSize = (myproc != nprocs-1) ? localStride : globalSize - localOffset;	// target localSize (without extra tuples)
-	const unsigned int localSizeExtra = (myproc != nprocs-1) ? localStride + (X-1) : globalSize - localOffset;	// target localSize with extra tuples
+	const unsigned int localOffset = comm.rank() * localStride;
+	localSize = (comm.rank() != comm.size()-1) ? localStride : globalSize - localOffset;	// target localSize (without extra tuples)
+	const unsigned int localSizeExtra = (comm.rank() != comm.size()-1) ? localStride + (X-1) : globalSize - localOffset;	// target localSize with extra tuples
 
 	const unsigned int globalMultipleOfX = (globalSize + X - 1) / X;	// rounded up number of global multiples of X
 	const unsigned int M = (localSize + X - 1) / X;			// number of incomplete X chars in local area size
 
-	uint samplesize = (uint)sqrt(localStride * D / X / nprocs) * samplefactor;
+	uint samplesize = (uint)sqrt(localStride * D / X / comm.size()) * samplefactor;
 	if ( samplesize >= D * (localStride / X) ) samplesize = D * (localStride / X) - 1;
 
 	if (debug)
@@ -927,53 +940,53 @@ public:
 	// rebalance input
 
 	{
-	    int* sendcnt = new int[ nprocs ];
-	    int* sendoff = new int[ nprocs ];
-	    int* recvcnt = new int[ nprocs ];
-	    int* recvoff = new int[ nprocs ];
+	    std::vector<int> sendcnt(comm.size(), 0);
+	    std::vector<int> sendoff(comm.size(), 0);
+	    std::vector<int> recvcnt(comm.size(), 0);
+	    std::vector<int> recvoff(comm.size(), 0);
 
-	    sendoff[0] = 0;
-	    for (int i = 1; i < nprocs; ++i)
+	    for (int i = 1; i < comm.size_signed(); ++i)
 	    {
 		if (debug_rebalance)
 		{
 		    std::cout << "range sent " << myproc << " -> " << i << " is "
-			      << RangeFix(i * localStride, localSizes[myproc], input.size()) << " - "
-			      << RangeFix((i+1) * localStride + Extra(i), localSizes[myproc], input.size()) << "\n";
+                  << RangeFix(i * localStride, localSizes[comm.rank()], input.size()) << " - "
+                  << RangeFix((i+1) * localStride + Extra(i), localSizes[comm.rank()], input.size()) << "\n";
 		}
 
-		sendoff[i] = RangeFix(i * localStride, localSizes[myproc], input.size());
-		sendcnt[i-1] = RangeFix(i * localStride + Extra(i-1), localSizes[myproc], input.size()) - sendoff[i-1];
+		sendoff[i] = RangeFix(i * localStride, localSizes[comm.rank()], input.size());
+		sendcnt[i-1] = RangeFix(i * localStride + Extra(i-1), localSizes[comm.rank()], input.size()) - sendoff[i-1];
 	    }
-	    sendcnt[nprocs-1] = input.size() - sendoff[nprocs-1];
+	    sendcnt[comm.size()-1] = input.size() - sendoff[comm.size()-1];
 	    
-	    DBG_ARRAY2(debug_rebalance, "sendcnt", sendcnt, nprocs);
-	    DBG_ARRAY2(debug_rebalance, "sendoff", sendoff, nprocs);
+	    DBG_ARRAY2(debug_rebalance, "sendcnt", sendcnt.data(), comm.size());
+	    DBG_ARRAY2(debug_rebalance, "sendoff", sendoff.data(), comm.size());
 
-	    recvoff[0] = 0;
 	    for (int i = 1; i < nprocs; ++i)
 	    {
 		if (debug_rebalance)
 		{
 		    std::cout << "range recv " << i << " -> " << myproc << " is "
-			      << RangeFix(localSizes[i], myproc * localStride, localSizeExtra) << "\n"
-			      << RangeFix(localSizes[i+1], myproc * localStride, localSizeExtra) << "\n";
+                  << RangeFix(localSizes[i], comm.rank() * localStride, localSizeExtra) << "\n"
+                  << RangeFix(localSizes[i+1], comm.rank() * localStride, localSizeExtra) << "\n";
 		}
 
-		recvoff[i] = RangeFix(localSizes[i], myproc * localStride, localSizeExtra);
-		recvcnt[i-1] = RangeFix(localSizes[i], myproc * localStride, localSizeExtra) - recvoff[i-1];
+		recvoff[i] = RangeFix(localSizes[i], comm.rank() * localStride, localSizeExtra);
+		recvcnt[i-1] = RangeFix(localSizes[i], comm.rank() * localStride, localSizeExtra) - recvoff[i-1];
 	    }
-	    recvcnt[nprocs-1] = localSizeExtra - recvoff[nprocs-1];
+	    recvcnt[comm.size()-1] = localSizeExtra - recvoff[comm.size()-1];
 
-	    DBG_ARRAY2(debug_rebalance, "recvcnt", recvcnt, nprocs);
-	    DBG_ARRAY2(debug_rebalance, "recvoff", recvoff, nprocs);
+	    DBG_ARRAY2(debug_rebalance, "recvcnt", recvcnt.data(), comm.size());
+	    DBG_ARRAY2(debug_rebalance, "recvoff", recvoff.data(), comm.size());
 
 	    std::vector<alphabet_type> recvbuf (localSizeExtra);
 
-	    MPI_Alltoallv( input.data(), sendcnt, sendoff, GET_MPI_DATATYPE(alphabet_type),
-			   recvbuf.data(), recvcnt, recvoff, GET_MPI_DATATYPE(alphabet_type), MPI_COMM_WORLD );
+      input = comm.alltoallv(kamping::send_buf(input), kamping::send_counts(sendcnt), kamping::send_displs(sendoff), kamping::recv_counts(recvcnt), kamping::recv_displs(recvoff));
+      
+	    // MPI_Alltoallv( input.data(), sendcnt, sendoff, GET_MPI_DATATYPE(alphabet_type),
+			   // recvbuf.data(), recvcnt, recvoff, GET_MPI_DATATYPE(alphabet_type), MPI_COMM_WORLD );
 	    
-	    std::swap(input, recvbuf);
+	    // std::swap(input, recvbuf);
 	}
 
 	DBG_ARRAY2(debug_input, "Input (without extra tuples)", input.data(), localSize);
@@ -1023,111 +1036,85 @@ public:
 	    // * select equidistance samples and redistribute sorted DC-tuples
 
 	    // select samples
-	    TupleS* samplebuf = new TupleS[ samplesize ];
+      std::vector<TupleS> samplebuf(samplesize);
 
 	    double dist = (double) R.size() / samplesize;
 	    for ( uint i = 0; i < samplesize; i++ )
-		samplebuf[i] = R[ int( i * dist ) ];
+        samplebuf[i] = R[ int( i * dist ) ];
 
-	    // root proc collects all samples
-	    TupleS* samplebufall = NULL;
-	    if (myproc == ROOT) samplebufall = new TupleS[ nprocs * samplesize ];
-
-	    MPI_Gather( samplebuf, samplesize, MPI_TUPLE_SAMPLE,
-			samplebufall, samplesize, MPI_TUPLE_SAMPLE, ROOT, MPI_COMM_WORLD );
-
-	    delete[] samplebuf;
-
+      auto samplebufall = comm.gather(kamping::send_buf(samplebuf));      
+      vector_free(samplebuf);
+      
 	    // root proc sorts samples as splitters
 
-	    TupleS* splitterbuf = new TupleS[ nprocs ];
+      std::vector<TupleS> splitterbuf(comm.size());
 
-	    if ( myproc == ROOT )
+	    if (comm.is_root())
 	    {
-		std::sort( samplebufall, samplebufall + samplesize * nprocs );
+        std::sort( samplebufall.begin(), samplebufall.end() );
 
-		DBG_ARRAY2(debug_sortsample, "Sample splitters", samplebufall, nprocs * samplesize);
+        DBG_ARRAY2(debug_sortsample, "Sample splitters", samplebufall.data(), comm.size() * samplesize);
 
-		for ( int i = 0; i < nprocs; i++ )		// pick splitters
-		    splitterbuf[i] = samplebufall[ i * samplesize ];
+        for ( int i = 0; i < comm.size_signed(); i++ )		// pick splitters
+          splitterbuf[i] = samplebufall[ i * samplesize ];
 
 		DBG_ARRAY2(debug_sortsample, "Selected splitters", splitterbuf, nprocs);
 
-		delete[] samplebufall;
+		vector_free(samplebufall);
 	    }
 
 	    // distribute splitters
-
-	    MPI_Bcast( splitterbuf, nprocs, MPI_TUPLE_SAMPLE, ROOT, MPI_COMM_WORLD );
+      comm.bcast(kamping::send_recv_buf(splitterbuf));
 
 	    // find nearest splitters in locally sorted tuple list
 
-	    uint* splitterpos = new uint[ nprocs + 1 ];
+      std::vector<uint> splitterpos(comm.size() + 1, 0);
 
 	    splitterpos[0] = 0;
-	    for ( int i = 1; i < nprocs; i++ )
+	    for ( int i = 1; i < comm.size_signed(); i++ )
 	    {
 		typename std::vector<TupleS>::const_iterator it = std::lower_bound(R.begin(), R.end(), splitterbuf[i]);
 
 		splitterpos[i] = it - R.begin();
 	    }
-	    splitterpos[ nprocs ] = R.size();
+	    splitterpos[comm.size()] = R.size();
 
-	    DBG_ARRAY2(debug_sortsample, "Splitters positions", splitterpos, nprocs+1);
+	    DBG_ARRAY2(debug_sortsample, "Splitters positions", splitterpos.data(), comm.size()+1);
 
-	    delete [] splitterbuf;
+	    vector_free(splitterbuf);
 
 	    // boardcast number of element in each division
 
-	    int* sendcnt = new int[ nprocs ];
-	    int* recvcnt = new int[ nprocs ];
+      std::vector<int> sendcnt(comm.size());
+	    // int* recvcnt = new int[ nprocs ];
 
-	    for ( int i = 0; i < nprocs; i++ )
+	    for ( int i = 0; i < comm.size_signed(); i++ )
 	    {
 		sendcnt[i] = splitterpos[i+1] - splitterpos[i] ;
 		assert( sendcnt[i] >= 0 );
 	    }
 
-	    delete[] splitterpos;
+	    vector_free(splitterpos);
 
-	    MPI_Alltoall( sendcnt, 1, MPI_INT, recvcnt, 1, MPI_INT , MPI_COMM_WORLD );
+      std::vector<int> recvoff(comm.size() + 1);
+      std::vector<int> recvcnt(comm.size(), 0);
+      R = comm.alltoallv(kamping::send_buf(R), kamping::send_counts(sendcnt), kamping::recv_displs_out(recvoff), kamping::recv_counts_out(recvcnt));
 
-	    // calculate number of received tuples
+      recvoff[comm.size()] = recvcnt[comm.size() - 1] + recvoff[comm.size() - 1];
 
-	    int* sendoff = new int[ nprocs + 1 ];
-	    int* recvoff = new int[ nprocs + 1 ];
+      vector_free(sendcnt);
+      vector_free(recvcnt);
 
-	    sendoff[ 0 ] = recvoff[ 0 ] = 0;
-	    for ( int i = 1; i < nprocs + 1; i++ )
-	    {
-		sendoff[i] = sendoff[i-1] + sendcnt[i-1];
-		recvoff[i] = recvoff[i-1] + recvcnt[i-1];
-	    }
+	    merge_areas(R, recvoff.data(), comm.size());
 
-	    std::vector<TupleS> recvbuf ( recvoff[ nprocs ] );
-
-	    //DBG_ARRAY2(1, "sendcnt", sendcnt, nprocs);
-	    //DBG_ARRAY2(1, "recvcnt", recvcnt, nprocs);
-
-	    MPI_Alltoallv( R.data(), sendcnt, sendoff, MPI_TUPLE_SAMPLE,
-			   recvbuf.data(), recvcnt, recvoff, MPI_TUPLE_SAMPLE, MPI_COMM_WORLD );
-
-	    std::swap(R, recvbuf);
-
-	    delete [] sendcnt;
-	    delete [] recvcnt;
-	    delete [] sendoff;
-
-	    merge_areas(R, recvoff, nprocs);
-
-	    delete [] recvoff;
+	    vector_free(recvoff);
 	}
 	// }}} end Sample sort of array R
 
 	DBG_ARRAY(debug_sortsample, "Sorted sample suffixes", R);
 	std::cout << "done global sort sample suffixes - mem = " << getmemusage() << "\n";
 
-	std::cout << "myproc " << myproc << " R.size() = " << R.size() << "\n";
+	std::cout << "myproc " << comm.rank() << " R.size() = " << R.size() << "\n";
 
 	// R contains DC-sample tuples in sorted order
 
@@ -1174,8 +1161,7 @@ public:
 
 	    // renaming with global names: calculate using prefix sum
 
-	    uint namesglob;
-	    MPI_Scan( &name, &namesglob, 1, MPI_UNSIGNED, MPI_SUM, MPI_COMM_WORLD );
+	    uint namesglob = comm.scan_single(kamping::send_buf(name), kamping::op(kamping::ops::plus<>()));
 
 	    // update local names - and free up first D names for sentinel ranks
 	    for ( uint i = 0; i < P.size(); i++ )
@@ -1188,7 +1174,7 @@ public:
 	    if (myproc == nprocs-1)
 		lastname = P.back().name;
 
-	    MPI_Bcast( &lastname, 1, MPI_INT, nprocs - 1, MPI_COMM_WORLD );
+      comm.bcast(kamping::send_recv_buf(lastname), kamping::root(comm.size() - 1));
 
 	    if (1 || debug_nameing)
 		std::cout << "last name: " << lastname << " =? " << D * globalMultipleOfX + D << "\n";
@@ -1211,7 +1197,7 @@ public:
 	    std::cout << "namesGlobalSize = " << namesGlobalSize << "\n"
 		      << "namesLocalStride = " << namesLocalStride << "\n";
 
-	    if (myproc == nprocs-1)
+	    if (comm.rank() == comm.size() - 1)
 	    {
 		for (unsigned int i = 0; i < D; ++i)
 		{
@@ -1225,7 +1211,7 @@ public:
 		std::vector<Pair> Pall;
 		gather_vector(P, Pall, 0, MPI_PAIR);
 
-		if (myproc == ROOT)
+		if (comm.is_root())
 		{
 		    std::sort(Pall.begin(), Pall.end(), Pair::cmpIndexModDiv);		// sort locally
 
@@ -1233,7 +1219,7 @@ public:
 		}
 	    }
 
-	    if (namesGlobalSize > 2 * X * nprocs)
+	    if (namesGlobalSize > 2 * X * comm.size())
 	    {
 		if (debug_recursion)
 		    std::cout << "---------------------   RECURSION pDCX ----------------  - mem = " << getmemusage() << std::endl;
@@ -1245,11 +1231,8 @@ public:
 
 		DBG_ARRAY(debug_recursion, "Names locally sorted by cmpModDiv", P);
 
-		uint* splitterpos = new uint[nprocs+1];
-		int* sendcnt = new int[nprocs];
-		int* sendoff = new int[nprocs+1];
-		int* recvcnt = new int[nprocs];
-		int* recvoff = new int[nprocs+1];
+    std::vector<uint> splitterpos(nprocs+1, 0);
+    std::vector<int> sendcnt(nprocs, 0);
 
 		// use equidistance splitters from 0..namesGlobalSize (because indexes are known in advance)
 		splitterpos[0] = 0;
@@ -1269,33 +1252,25 @@ public:
 		    typename std::vector<Pair>::const_iterator it = std::lower_bound(P.begin(), P.end(), ptemp, Pair::cmpIndexModDiv);
 		    splitterpos[i] = it - P.begin();
 		}
-		splitterpos[ nprocs ] = P.size();
+		splitterpos[comm.size()] = P.size();
 
 		DBG_ARRAY2(debug_recursion, "Splitters positions", splitterpos, nprocs+1);
 
 		for ( int i = 0; i < nprocs; i++ )
 		{
-		    sendcnt[ i ] = splitterpos[ i + 1 ] - splitterpos[ i ];
+		    sendcnt[i] = splitterpos[i + 1] - splitterpos[i];
 		    assert( sendcnt[ i ] >= 0 );
 		}
 
-		MPI_Alltoall( sendcnt, 1, MPI_INT, recvcnt, 1, MPI_INT , MPI_COMM_WORLD );
-
-		sendoff[0] = recvoff[0] = 0;
-		for ( int i = 1; i <= nprocs; i++ ) {
-		    sendoff[i] = sendoff[i - 1] + sendcnt[i - 1];
-		    recvoff[i] = recvoff[i - 1] + recvcnt[i - 1];
-		}
-		recvoff[nprocs] = recvoff[nprocs - 1] + recvcnt[nprocs - 1];
-
-		std::vector<Pair> recvBufPair ( recvoff[ nprocs ] );
-
-		MPI_Alltoallv( P.data(), sendcnt, sendoff, MPI_PAIR, recvBufPair.data(), recvcnt, recvoff, MPI_PAIR, MPI_COMM_WORLD );
+    std::vector<int> recvcnt(comm.size());
+    std::vector<int> recvoff(comm.size() + 1);
+    std::vector<Pair> recvBufPair = comm.alltoallv(kamping::send_buf(P), kamping::send_counts(sendcnt), kamping::recv_displs_out(recvoff), kamping::recv_counts_out(recvcnt));
+    recvoff[comm.size()] = recvoff[comm.size() - 1] + recvcnt[comm.size() - 1];
 
 		vector_free(P);
 
 		// final X-1 tuples should be ignored due to recvoff areas
-		merge_areas(recvBufPair, recvoff, nprocs, Pair::cmpIndexModDiv);
+		merge_areas(recvBufPair, recvoff.data(), nprocs, Pair::cmpIndexModDiv);
 
 		// TODO: merge and reduce at once
 
@@ -1371,10 +1346,10 @@ public:
 
 		    DBG_ARRAY(debug_recursion, "namearray", namearray);
 
-		    assert( namearray.size() == namesLocalStride || myproc == nprocs-1 );
+		    assert( namearray.size() == namesLocalStride || comm.rank() == comm.size() - 1);
 
 		    pDCX<DCParam, uint> rdcx;
-		    rdcx.dcx( namearray, depth+1, lastname+1 );
+		    rdcx.dcx(namearray, depth+1, lastname+1, comm);
 
 		    if (debug_rec_selfcheck)
 		    {
@@ -1390,12 +1365,12 @@ public:
 			DBG_ARRAY(debug_recursion, "nameAll", nameAll);
 			DBG_ARRAY(debug_recursion, "SAall", SAall);
 
-			if (myproc == ROOT)
+			if (comm.is_root())
 			{
 			    assert( sachecker::sa_checker(nameAll, SAall) );			    
 			}
 
-			MPI_Barrier( MPI_COMM_WORLD );
+			comm.barrier();
 		    }
 
 		    vector_free(namearray);
@@ -1403,13 +1378,13 @@ public:
 		    DBG_ARRAY(debug_recursion, "Recursive localSA", rdcx.localSA);
 
 		    uint SAsize = rdcx.localSA.size();
-		    uint allSAsize[nprocs+1];
+		    std::vector<uint> allSAsize(comm.size() + 1, 0);
 
-		    MPI_Allgather( &SAsize, 1, MPI_UNSIGNED, allSAsize, 1, MPI_UNSIGNED, MPI_COMM_WORLD );
+        comm.allgather(kamping::send_buf(SAsize), kamping::recv_buf(allSAsize));
 
-		    exclusive_prefixsum(allSAsize, nprocs);
+		    exclusive_prefixsum(allSAsize.data(), comm.size());
 
-		    DBG_ARRAY2(debug_recursion, "allSAsize", allSAsize, nprocs+1);
+		    DBG_ARRAY2(debug_recursion, "allSAsize", allSAsize.data(), comm.size()+1);
 
 		    // generate array of pairs (index,rank) from localSA
 
@@ -1438,7 +1413,7 @@ public:
 		std::vector<Pair> Pall;
 		gather_vector(P, Pall, 0, MPI_PAIR);
 
-		if (myproc == ROOT)
+		if (comm.is_root())
 		{
 		    assert( Pall.size() == (int)namesGlobalSize );
 
@@ -1497,11 +1472,8 @@ public:
 
 	    DBG_ARRAY(debug_recursion, "Pairs P (sorted by index)", P);
 
-	    uint* splitterpos = new uint[nprocs+1];
-	    int* sendcnt = new int[nprocs];
-	    int* sendoff = new int[nprocs+1];
-	    int* recvcnt = new int[nprocs];
-	    int* recvoff = new int[nprocs+1];
+      std::vector<uint> splitterpos(comm.size()+1, 0);
+      std::vector<int> sendcnt(nprocs, 0);
 
 	    // use equidistance splitters from 0..globalSize (because names are unique)
 	    splitterpos[ 0 ] = 0;
@@ -1521,23 +1493,17 @@ public:
 		assert( sendcnt[ i ] >= 0 );
 	    }
 
-	    MPI_Alltoall( sendcnt, 1, MPI_INT, recvcnt, 1, MPI_INT , MPI_COMM_WORLD );
-
-	    sendoff[ 0 ] = recvoff[ 0 ] = 0;
-	    for ( int i = 1; i <= nprocs; i++ ) {
-		sendoff[ i ] = sendoff[ i - 1 ] + sendcnt[ i - 1 ];
-		recvoff[ i ] = recvoff[ i - 1 ] + recvcnt[ i - 1 ];
-	    }
-	    recvoff[ nprocs ] = recvoff[ nprocs - 1 ] + recvcnt[ nprocs - 1 ];
-
-	    std::vector<Pair> recvBufPair ( recvoff[ nprocs ] + D );
-	    unsigned int recvBufPairSize = recvoff[ nprocs ];
-
-	    MPI_Alltoallv( P.data(), sendcnt, sendoff, MPI_PAIR, recvBufPair.data(), recvcnt, recvoff, MPI_PAIR, MPI_COMM_WORLD );
-
+      std::vector<int> recvcnt(comm.size(), 0);
+      std::vector<int> recvoff(comm.size() + 1, 0);
+	    // MPI_Alltoallv( P.data(), sendcnt, sendoff, MPI_PAIR, recvBufPair.data(), recvcnt, recvoff, MPI_PAIR, MPI_COMM_WORLD );
+      std::vector<Pair> recvBufPair = comm.alltoallv(kamping::send_buf(P), kamping::send_counts(sendcnt), kamping::recv_counts_out(recvcnt), kamping::recv_displs_out(recvoff));
+      recvoff[comm.size()] = recvoff[comm.size() - 1] + recvcnt[comm.size() - 1];
+	    unsigned int recvBufPairSize = recvoff[comm.size()];
+      recvBufPair.resize(recvoff[ comm.size() ] + D);
+      
 	    vector_free(P);
 
-	    merge_areas(recvBufPair, recvoff, nprocs);
+	    merge_areas(recvBufPair, recvoff.data(), comm.size());
 
 	    DBG_ARRAY2(debug_recursion, "Pairs P (globally sorted by index)", recvBufPair.data(), recvBufPairSize);
 
@@ -1552,7 +1518,7 @@ public:
 
 	    DBG_ARRAY2(debug_recursion, "Pairs P (extra tuples)", temp, D);
 
-	    if ( myproc == nprocs - 1 )	// last processor gets sentinel tuples with lowest ranks
+	    if ( comm.rank() == comm.size() - 1 )	// last processor gets sentinel tuples with lowest ranks
 	    {
 		for (unsigned int i = 0; i < D; ++i)
 		{
@@ -1574,11 +1540,6 @@ public:
 	    std::swap(recvBufPair, P);
 
 	    DBG_ARRAY(debug_recursion, "Pairs P (globally sorted by index + extra tuples)", P);
-
-	    delete[] sendcnt;
-	    delete[] sendoff;
-	    delete[] recvcnt;
-	    delete[] recvoff;
 	}
 
 	// P contains pairs of index and global rank: sorted by index and partitioned by localSize
@@ -1597,7 +1558,7 @@ public:
 	{
 	    for (unsigned int k = 0; k < X; ++k)
 	    {
-		S[k][i].index = myproc * localStride + i * X + k;
+        S[k][i].index = comm.rank() * localStride + i * X + k;
 
 		for (unsigned int c = 0; c < X-1; ++c)
 		    S[k][i].chars[c] = (i*X + k + c < localSizeExtra) ? input[ i*X + k + c ] : 0;
@@ -1625,7 +1586,7 @@ public:
 
 	    // select equidistant samples
 
-	    TupleN* samplebuf = new TupleN[ X * samplesize ];
+      std::vector<TupleN> samplebuf(X * samplesize);
 
 	    double dist = ( double ) M / samplesize;
 	    for ( uint i = 0, j = 0; i < samplesize; i++ )
@@ -1636,39 +1597,35 @@ public:
 		}
 	    }
 
-	    // root proc collects all samples
-	    TupleN* samplebufall = NULL;
-	    if (myproc == ROOT) samplebufall = new TupleN[ nprocs * X * samplesize ];
+      std::vector<TupleN> samplebufall = comm.gather(kamping::send_buf(samplebuf));
 
-	    MPI_Gather( samplebuf, X * samplesize, MPI_TUPLE_NONSAMPLE, samplebufall, X * samplesize, MPI_TUPLE_NONSAMPLE, ROOT, MPI_COMM_WORLD );
-
-	    delete[] samplebuf;
+      vector_free(samplebuf);
 
 	    // root proc sorts samples as splitters
 
-	    TupleN* splitterbuf = new TupleN[ nprocs ];
+      std::vector<TupleN> splitterbuf(comm.size());
 
-	    if ( myproc == ROOT )
+	    if (comm.is_root())
 	    {
-		std::sort( samplebufall, samplebufall + nprocs * X * samplesize, cmpTupleNCompare );
+        std::sort( samplebufall.begin(), samplebufall.end(), cmpTupleNCompare );
 
-		DBG_ARRAY2(debug_finalsort, "Sample splitters", samplebufall, nprocs * X * samplesize);
+        DBG_ARRAY2(debug_finalsort, "Sample splitters", samplebufall.data(), comm.size() * X * samplesize);
 
-		for ( int i = 0; i < nprocs; i++ )		// pick splitters
+        for ( int i = 0; i < comm.size_signed(); i++ )		// pick splitters
 		    splitterbuf[i] = samplebufall[ i * X * samplesize ];
 
 		DBG_ARRAY2(debug_finalsort, "Selected splitters", splitterbuf, nprocs);
 
-		delete[] samplebufall;
+		vector_free(samplebufall);
 	    }
 
 	    // distribute splitters
-
-	    MPI_Bcast( splitterbuf, nprocs, MPI_TUPLE_NONSAMPLE, ROOT, MPI_COMM_WORLD );
+      comm.bcast(kamping::send_recv_buf(splitterbuf));
+	    // MPI_Bcast( splitterbuf, nprocs, MPI_TUPLE_NONSAMPLE, ROOT, MPI_COMM_WORLD );
 
 	    // find nearest splitters in each of the locally sorted tuple list
 
-	    uint** splitterpos = new uint*[X];
+	 	    uint** splitterpos = new uint*[X];
 
 	    for (unsigned int k = 0; k < X; ++k)
 	    {
@@ -1689,18 +1646,17 @@ public:
 		DBG_ARRAY2(debug_finalsort, "Splitters S." << k, splitterpos[k], nprocs+1);
 	    }
 
-	    delete [] splitterbuf;
+	    vector_free(splitterbuf);
 
 	    // boardcast number of element in each division
 
-	    int** sendcnt = new int*[X];
-	    int** recvcnt = new int*[X];
+	    // int** sendcnt = new int*[X];
+      std::vector<std::vector<int>> sendcnt(X, std::vector<int>(comm.size(), 0));
+	    std::vector<std::vector<int>> recvcnt(X, std::vector<int>(comm.size(), 0));
+      std::vector<std::vector<int>> recvoff(X, std::vector<int>(comm.size() + 1, 0));
 
 	    for (unsigned int k = 0; k < X; ++k)
 	    {
-		sendcnt[k] = new int[ nprocs ];
-		recvcnt[k] = new int[ nprocs ];
-
 		for ( int i = 0; i < nprocs; i++ )
 		{
 		    sendcnt[k][i] = splitterpos[k][i+1] - splitterpos[k][i];
@@ -1709,49 +1665,24 @@ public:
 		}
 
 		delete [] splitterpos[k];
-
-		MPI_Alltoall( sendcnt[k], 1, MPI_INT, recvcnt[k], 1, MPI_INT , MPI_COMM_WORLD );
 	    }
 
 	    delete [] splitterpos;
 
 	    // calculate number of received tuples
-
-	    int** sendoff = new int*[X];
-	    int** recvoff = new int*[X];
 	    unsigned int totalsize = 0;
 
 	    for (unsigned int k = 0; k < X; ++k)
 	    {
-		sendoff[k] = new int[ nprocs + 1 ];
-		recvoff[k] = new int[ nprocs + 1 ];
+        S[k] = comm.alltoallv(kamping::send_buf(S[k]), kamping::send_counts(sendcnt[k]), kamping::recv_counts_out(recvcnt[k]), kamping::recv_displs_out(recvoff[k]));
 
-		sendoff[k][ 0 ] = recvoff[k][ 0 ] = 0;
-		for ( int i = 1; i <= nprocs; i++ )
-		{
-		    sendoff[k][i] = sendoff[k][i-1] + sendcnt[k][i-1];
-		    recvoff[k][i] = recvoff[k][i-1] + recvcnt[k][i-1];
-
-		    assert(sendoff[k][i] >= 0);
-		    assert(recvoff[k][i] >= 0);
-		}
-
-		std::vector<TupleN> recvbuf ( recvoff[k][ nprocs ] );
-
-		MPI_Alltoallv( S[k].data(), sendcnt[k], sendoff[k], MPI_TUPLE_NONSAMPLE, recvbuf.data(), recvcnt[k], recvoff[k], MPI_TUPLE_NONSAMPLE, MPI_COMM_WORLD );
-
-		std::swap(S[k], recvbuf);
-
-		delete [] sendcnt[k];
-		delete [] recvcnt[k];
-		delete [] sendoff[k];
+    recvoff[k][comm.size()] = recvoff[k][comm.size() - 1] + recvcnt[k][comm.size() - 1];
 
 		totalsize += S[k].size();
 	    }
 
-	    delete [] sendcnt;
-	    delete [] sendoff;
-	    delete [] recvcnt;
+	    vector_free(sendcnt);
+	    vector_free(recvcnt);
 
 	    // merge received array parts
 
@@ -1759,13 +1690,12 @@ public:
 	    {
 		if ( S[k].size() )
 		{
-		    merge_areas(S[k], recvoff[k], nprocs, cmpTupleNdepth<X-1>);
+      merge_areas(S[k], recvoff[k].data(), comm.size(), cmpTupleNdepth<X-1>);
 
-		    delete [] recvoff[k];
 		}
 	    }
 
-	    delete [] recvoff;
+	    vector_free(recvoff);
 
 	    for (unsigned int k = 0; k < X; ++k)
 	    {
@@ -1819,12 +1749,12 @@ public:
 
     std::vector<uint8_t>	localInput;
 
-    bool run(const char* filename)
+  bool run(const char* filename, kamping::Communicator<>& comm)
     {
 	// **********************************************************************
 	// * Read input file size
 
-	if (myproc == ROOT)
+      if (comm.is_root())
 	{
 	    std::ifstream infile( filename );
 
@@ -1841,21 +1771,21 @@ public:
 	    unsigned int reducesize = getenv("SIZE") ? strtoul(getenv("SIZE"),&endptr,10) : 0;
 	    if (!endptr || *endptr != '\0') reducesize = 0;
 
-	    if (reducesize && globalSize > reducesize)
+	    if (reducesize && globalSize > reducesize) 
 		globalSize = reducesize;
 	}
 
-	MPI_Bcast( &globalSize, 1, MPI_UNSIGNED, ROOT, MPI_COMM_WORLD );
+      comm.bcast_single(kamping::send_recv_buf(globalSize));
 
 	// **********************************************************************
 	// * Calculate local input size (= general stride)
 
-	localStride = ( globalSize + nprocs - 1 ) / nprocs;	// divide by processors rounding up
+	localStride = ( globalSize + comm.size() - 1 ) / comm.size();	// divide by processors rounding up
 	localStride += X - localStride % X;			// round up to nearest multiple of X
 
-	assert( localStride * nprocs >= globalSize );
+	assert( localStride * comm.size() >= globalSize );
 
-	if ( myproc == ROOT )
+	if (comm.is_root())
 	{
 	    std::cout << "Total input size = " << globalSize << " bytes. localStride = " << localStride << std::endl;
 	}
@@ -1867,21 +1797,21 @@ public:
 
 	assert( sizeof(alphabet_type) == 1 );
 
-	if (myproc == ROOT)
+	if (comm.is_root())
 	{
 	    std::ifstream infile( filename, std::ios::binary );
 
 	    // read input for processors 1 to n-1
-	    for (int p = 1; p < nprocs; ++p)
+	    for (int p = 1; p < comm.size_signed(); ++p)
 	    {
 		infile.seekg( p * localStride, std::ios::beg );
 
-		uint readsize = (p != nprocs-1) ? localStride : globalSize - (p * localStride);
+		uint readsize = (p != comm.size_signed() - 1) ? localStride : globalSize - (p * localStride);
 
 		std::cout << "Read for process " << p << " from pos " << p * localStride << " of length " << readsize << std::endl;
 
 		infile.read( (char*)localInput.data(), readsize );
-		MPI_Send( localInput.data(), readsize, MPI_CHAR, p, MSGTAG, MPI_COMM_WORLD );
+    comm.send(kamping::send_buf(localInput), kamping::destination(p), kamping::send_count(readsize), kamping::tag(MSGTAG));
 	    }
 
 	    if (!infile.good()) {
@@ -1903,24 +1833,15 @@ public:
 	}
 	else // not ROOT: receive data
 	{
-	    MPI_Recv( localInput.data(), localStride, MPI_CHAR, ROOT, MSGTAG, MPI_COMM_WORLD, &status );
-
-	    int recvcnt;
-	    MPI_Get_count(&status, MPI_CHAR, &recvcnt);
-
-	    uint readsize = (myproc != nprocs-1) ? localStride : globalSize - (myproc * localStride);
-
-	    assert( (int)readsize == recvcnt );
-
-	    localInput.resize(readsize);
+    comm.recv(kamping::recv_buf<kamping::resize_to_fit>(localInput), kamping::source(comm.root()), kamping::tag(MSGTAG));
 	}
 
-	MPI_Barrier( MPI_COMM_WORLD );
+  comm.barrier();
 
 	// **********************************************************************
 	// * Construct suffix array recursively
 
-	dcx( localInput, 0, 256 );
+	dcx(localInput, 0, 256, comm);
 
 	return true;
     }
@@ -2335,19 +2256,24 @@ public:
 };
 
 template <typename DCParam>
-void DCXRun(int myproc, const char* input, const char* output)
+void DCXRun(const char* input, const char* output)
 {
+
+  kamping::Communicator<> comm(MPI_COMM_WORLD);
+
+  int myproc = comm.rank();
+  
     double tstart = MPI_Wtime();
 
     pDCX<DCParam, uint8_t> dcx;
 
-    dcx.run(input);
+    dcx.run(input, comm);
 
     if (output) {
         dcx.writeSA(output);
     }
 
-    MPI_Barrier( MPI_COMM_WORLD );
+    comm.barrier();
 
     double tend = MPI_Wtime();
 
@@ -2366,14 +2292,8 @@ void DCXRun(int myproc, const char* input, const char* output)
 
 int main( int argc, char **argv )
 {
-    MPI_Init( &argc, &argv );
-
-    int myproc, nprocs;
-
-    MPI_Comm_rank( MPI_COMM_WORLD, &myproc );
-    MPI_Comm_size( MPI_COMM_WORLD, &nprocs );
-
-    if ( nprocs <= 1 )
+  kamping::Environment env;
+  if (kamping::world_size() <= 1)
     {
 	std::cerr << "Error: requires more than one MPI processor (use -np 2)." << std::endl;
 	return -1;
@@ -2387,18 +2307,17 @@ int main( int argc, char **argv )
     }
 
     if (strcmp(argv[1], "3") == 0) {
-        DCXRun<DC3Param>(myproc, argv[2], argv[3]);
+      DCXRun<DC3Param>(argv[2], argv[3]);
     }
     else if (strcmp(argv[1], "7") == 0) {
-        DCXRun<DC7Param>(myproc, argv[2], argv[3]);
+      DCXRun<DC7Param>(argv[2], argv[3]);
     }
     else if (strcmp(argv[1], "13") == 0) {
-        DCXRun<DC13Param>(myproc, argv[2], argv[3]);
+      DCXRun<DC13Param>(argv[2], argv[3]);
     }
     else {
         std::cout << "Usage: pDCX <3/7/13> <input> [output]" << std::endl;
     }
 
-    MPI_Finalize();
     return 0;
 }

@@ -7,8 +7,8 @@ cmake_minimum_required(VERSION 2.6.2)
 
 enable_testing()
 
-# options
-
+# add KaMPIng
+add_subdirectory(extlib/kamping)
 
 # disallow in-source builds
 
